@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">经典返回</string>
+    <string name="module_description">为作用域内的应用恢复经典返回手势（关闭预测性返回）</string>
+</resources>

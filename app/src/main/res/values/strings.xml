@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Classic Back</string>
+    <string name="module_description">Restore classic back gestures for scoped apps (disable predictive back).</string>
+</resources>
