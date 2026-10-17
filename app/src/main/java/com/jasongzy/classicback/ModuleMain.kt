@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.util.Log
 import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import io.github.libxposed.api.XposedInterface.ExceptionMode
 import io.github.libxposed.api.XposedInterface.HookHandle
 import io.github.libxposed.api.XposedModule
@@ -13,7 +14,7 @@ import java.lang.reflect.Modifier
 import java.util.WeakHashMap
 
 class ModuleMain : XposedModule() {
-    private val callbacks = WeakHashMap<OnBackInvokedCallback, OnBackInvokedCallback>()
+    private val callbacks = WeakHashMap<OnBackInvokedCallback, WeakReference<OnBackInvokedCallback>>()
     @Volatile private var enabled = false
 
     @SuppressLint("PrivateApi")
@@ -58,7 +59,8 @@ class ModuleMain : XposedModule() {
                 if (!enabled) return@intercept chain.proceed()
                 val callback = chain.args[0] as OnBackInvokedCallback
                 val replacement = synchronized(callbacks) {
-                    callbacks[callback] ?: classicFlutterCallback(callback)?.also { callbacks[callback] = it }
+                    callbacks[callback]?.get() ?: (classicNavigationCallback(callback) ?: classicFlutterCallback(callback))
+                        ?.also { callbacks[callback] = WeakReference(it) }
                 }
                 if (replacement == null) chain.proceed() else {
                     val args = chain.args.toTypedArray()
@@ -68,7 +70,7 @@ class ModuleMain : XposedModule() {
             }
             handles += hook(unregister).setExceptionMode(ExceptionMode.PROTECTIVE).intercept { chain ->
                 val callback = chain.args[0] as? OnBackInvokedCallback
-                val replacement = if (enabled) synchronized(callbacks) { callbacks[callback] } else null
+                val replacement = if (enabled) synchronized(callbacks) { callbacks[callback]?.get() } else null
                 if (replacement == null) chain.proceed() else chain.proceed(arrayOf(replacement))
             }
             enabled = true
@@ -88,9 +90,36 @@ internal fun classicCallbackInfoArgs(args: List<Any?>): Array<Any?>? {
     return args.toTypedArray().also { it[1] = 0 }
 }
 
+internal fun classicNavigationCallback(callback: OnBackInvokedCallback): OnBackInvokedCallback? {
+    if (callback.javaClass.interfaces.none { it.name == "android.window.OnBackAnimationCallback" }) return null
+    // shortcut: match the verified NavigationEvent input layout; extend after validating new layouts.
+    val captured = callback.javaClass.declaredFields.singleOrNull { !Modifier.isStatic(it.modifiers) } ?: return null
+    val input = captured.type
+    if ((!Modifier.isAbstract(input.modifiers) && !Modifier.isFinal(input.modifiers)) ||
+        input.classLoader !== callback.javaClass.classLoader ||
+        input.declaredConstructors.none {
+            it.parameterTypes.contentEquals(arrayOf(OnBackInvokedDispatcher::class.java, Int::class.javaPrimitiveType))
+        }) return null
+    val fields = input.declaredFields.filter { !Modifier.isStatic(it.modifiers) }
+    if (fields.size != 4 || fields.map { it.type }.toSet() != setOf(
+            OnBackInvokedDispatcher::class.java, Int::class.javaPrimitiveType,
+            OnBackInvokedCallback::class.java, Boolean::class.javaPrimitiveType,
+        )) return null
+    val base = input.superclass ?: return null
+    val baseFields = base.declaredFields.filter { !Modifier.isStatic(it.modifiers) }
+    if (!Modifier.isAbstract(base.modifiers) || base.superclass != Any::class.java || baseFields.size != 2 ||
+        baseFields.count { it.type == Boolean::class.javaPrimitiveType } != 1 ||
+        baseFields.none { !it.type.isPrimitive && it.type.classLoader === input.classLoader }) return null
+    val owner = captured.apply { isAccessible = true }.get(callback) ?: return null
+    val registered = fields.single { it.type == OnBackInvokedCallback::class.java }
+    if (registered.apply { isAccessible = true }.get(owner) !== callback) return null
+    // NavigationEvent synthesizes the start state when completion arrives without a predictive gesture.
+    return OnBackInvokedCallback { callback.onBackInvoked() }
+}
+
 @Suppress("DEPRECATION")
 private fun classicFlutterCallback(callback: OnBackInvokedCallback): OnBackInvokedCallback? {
-    // shortcut: only Flutter's verified legacy entry is adapted; add others after verifying their back contract.
+    // Flutter's predictive callback needs gesture state, so use its verified legacy entry.
     val owner = callback.javaClass.declaredFields.filter {
         !Modifier.isStatic(it.modifiers) &&
             (it.type == Any::class.java || Activity::class.java.isAssignableFrom(it.type))
